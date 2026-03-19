@@ -1,0 +1,274 @@
+name: Windows Cloud PC
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cloud-pc:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+
+    - name: Setup Windows User and RDP
+      shell: powershell
+      run: |
+        $user = "CloudPC"
+        $pass = "Str0ng#Pass99!"
+        $secPass = ConvertTo-SecureString $pass -AsPlainText -Force
+        New-LocalUser -Name $user -Password $secPass -FullName "Cloud PC" -PasswordNeverExpires -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+        $check = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+        if ($check) { Write-Host "OK - User: $user / Pass: $pass" }
+        else { Write-Host "ERROR: user failed"; exit 1 }
+
+    - name: Disable Firewall and Open All Ports
+      shell: powershell
+      run: |
+        netsh advfirewall set allprofiles state off
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+        $tcp = @(3389,47984,47989,47990,47998,47999,48000,48002,48010,48011,48012)
+        $udp = @(47998,47999,48000,48002,48010,48011,48012,41641)
+        foreach ($p in $tcp) {
+          netsh advfirewall firewall add rule name="TCP_$p" dir=in action=allow protocol=TCP localport=$p | Out-Null
+          netsh advfirewall firewall add rule name="TCP_OUT_$p" dir=out action=allow protocol=TCP localport=$p | Out-Null
+        }
+        foreach ($p in $udp) {
+          netsh advfirewall firewall add rule name="UDP_$p" dir=in action=allow protocol=UDP localport=$p | Out-Null
+        }
+        Write-Host "Firewall OFF - All ports opened"
+
+    - name: Install Tailscale
+      shell: powershell
+      run: |
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "ts.exe" -UseBasicParsing
+        Start-Process "ts.exe" -Args "/S" -Wait
+        Start-Sleep -Seconds 12
+        Write-Host "Tailscale installed"
+
+    - name: Start Tailscale and Get Login URL
+      shell: powershell
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+        Start-Process -FilePath $ts -ArgumentList "up","--reset" `
+          -RedirectStandardOutput "$env:TEMP\ts_out.txt" `
+          -RedirectStandardError "$env:TEMP\ts_err.txt" `
+          -NoNewWindow -PassThru
+        Start-Sleep -Seconds 25
+        $out = (Get-Content "$env:TEMP\ts_out.txt" -ErrorAction SilentlyContinue) -join " "
+        $err = (Get-Content "$env:TEMP\ts_err.txt" -ErrorAction SilentlyContinue) -join " "
+        $m = [regex]::Match("$out $err", 'https://login\.tailscale\.com\S+')
+        Write-Host "=== MO LINK NAY TREN DIEN THOAI DE DANG NHAP TAILSCALE ==="
+        if ($m.Success) { Write-Host $m.Value }
+        else { Write-Host "$out $err" }
+        Write-Host "==========================================================="
+        Write-Host "Waiting for Tailscale login (max 10 min)..."
+        for ($i = 0; $i -lt 60; $i++) {
+          $status = (& $ts status 2>&1) -join " "
+          if ($status -notlike "*NeedsLogin*" -and $status -notlike "*Logged out*" -and $status.Trim().Length -gt 20) {
+            Write-Host "Tailscale connected!"
+            & $ts ip -4
+            break
+          }
+          if ($i % 12 -eq 0 -and $i -gt 0) {
+            $up2 = (& $ts up 2>&1) -join " "
+            $m2 = [regex]::Match($up2, 'https://login\.tailscale\.com\S+')
+            if ($m2.Success) { Write-Host "Login URL: $($m2.Value)" }
+          }
+          Start-Sleep -Seconds 10
+        }
+
+    - name: Download and Install Apollo
+      shell: powershell
+      run: |
+        $dlUrl = ""
+        try {
+          $api = Invoke-RestMethod "https://api.github.com/repos/ClassicOldSong/Apollo/releases/latest" -UseBasicParsing
+          Write-Host "Apollo version: $($api.tag_name)"
+          Write-Host "Available assets:"
+          $api.assets | ForEach-Object { Write-Host "  $($_.name)" }
+          $asset = $api.assets | Where-Object { $_.name -like "*windows*" -and $_.name -like "*.exe" } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $api.assets | Where-Object { $_.name -like "*.exe" } | Select-Object -First 1
+          }
+          if ($asset) { $dlUrl = $asset.browser_download_url }
+        } catch {
+          Write-Host "API error: $_"
+        }
+        if (-not $dlUrl) {
+          $dlUrl = "https://github.com/ClassicOldSong/Apollo/releases/latest/download/apollo-windows-installer.exe"
+        }
+        Write-Host "Downloading: $dlUrl"
+        Invoke-WebRequest -Uri $dlUrl -OutFile "apollo-setup.exe" -UseBasicParsing -TimeoutSec 180
+        Write-Host "Installing..."
+        Start-Process "apollo-setup.exe" -Args "/S" -Wait
+        Start-Sleep -Seconds 25
+        Write-Host "Install done"
+
+    - name: Configure and Start Apollo
+      shell: powershell
+      run: |
+        # Apollo cai vao C:\Program Files\Apollo\sunshine.exe
+        # Tim chinh xac - uu tien duong dan biet truoc
+        $knownPaths = @(
+          "C:\Program Files\Apollo\sunshine.exe",
+          "C:\Program Files\Apollo\apollo.exe",
+          "C:\Program Files (x86)\Apollo\sunshine.exe",
+          "C:\Program Files (x86)\Apollo\apollo.exe"
+        )
+
+        $apolloExe = $null
+        foreach ($kp in $knownPaths) {
+          if (Test-Path $kp) {
+            $apolloExe = $kp
+            Write-Host "Found at known path: $apolloExe"
+            break
+          }
+        }
+
+        # Neu khong co thi tim rong
+        if (-not $apolloExe) {
+          Write-Host "Searching broadly..."
+          $found = Get-ChildItem "C:\Program Files","C:\Program Files (x86)" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Extension -eq ".exe" -and
+              $_.Name -notlike "*uninstall*" -and
+              $_.Name -notlike "*setup*" -and
+              $_.Name -notlike "*redist*" -and
+              ($_.DirectoryName -like "*Apollo*" -or $_.DirectoryName -like "*apollo*")
+            } | Select-Object -First 1
+          if ($found) {
+            $apolloExe = $found.FullName
+            Write-Host "Found by search: $apolloExe"
+          }
+        }
+
+        if (-not $apolloExe) {
+          Write-Host "FATAL: Cannot find Apollo exe"
+          Write-Host "C:\Program Files contents:"
+          Get-ChildItem "C:\Program Files" | Select-Object Name
+          exit 1
+        }
+
+        # Config
+        $apolloDir = Split-Path $apolloExe -Parent
+        $cfgDir = "$apolloDir\config"
+        if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
+        $conf = "origin_web_ui_allowed = wan`nupnp = enabled`nport = 47989`naddress_family = both"
+        Set-Content "$cfgDir\apollo.conf" $conf -Encoding UTF8
+        Write-Host "Config written to: $cfgDir\apollo.conf"
+
+        # Set credentials
+        Write-Host "Setting credentials: apollo / apollo123"
+        Start-Process $apolloExe -ArgumentList "--creds","apollo","apollo123" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+
+        # Start Apollo
+        $cfgFile = "$cfgDir\apollo.conf"
+        if (Test-Path $cfgFile) {
+          Start-Process $apolloExe -ArgumentList $cfgFile -WindowStyle Hidden
+        } else {
+          Start-Process $apolloExe -WindowStyle Hidden
+        }
+        Write-Host "Apollo started from: $apolloExe"
+
+        # Luu path cho buoc sau (dung Set-Content voi string ro rang)
+        [System.IO.File]::WriteAllText("$env:TEMP\apollo_path.txt", $apolloExe)
+
+        # Verify ports
+        $ok = $false
+        for ($i = 1; $i -le 15; $i++) {
+          Start-Sleep -Seconds 8
+          $p90 = netstat -ano | findstr ":47990"
+          $p89 = netstat -ano | findstr ":47989"
+          $procName = (Split-Path $apolloExe -Leaf) -replace "\.exe",""
+          $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
+          Write-Host "Check $i/15 | Proc: $(if($proc){'OK'}else{'dead'}) | :47990=$(if($p90){'OPEN'}else{'closed'}) | :47989=$(if($p89){'OPEN'}else{'closed'})"
+          if ($p90 -or $p89) {
+            Write-Host "SUCCESS - Apollo is running and ports are open!"
+            $ok = $true
+            break
+          }
+          if (-not $proc) {
+            Write-Host "Restarting Apollo..."
+            Start-Process $apolloExe -WindowStyle Hidden
+          }
+        }
+        if (-not $ok) {
+          Write-Host "WARNING: Ports not detected after checks"
+          netstat -ano | findstr "479"
+        }
+
+    - name: Print All Connection Info
+      shell: powershell
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+        $tsIP = (& $ts ip -4 2>&1 | Select-Object -First 1).Trim()
+        $hostname = hostname
+        $p90 = if (netstat -ano | findstr ":47990") { "OPEN" } else { "CLOSED" }
+        $p89 = if (netstat -ano | findstr ":47989") { "OPEN" } else { "CLOSED" }
+        $proc = if (Get-Process | Where-Object { $_.Name -like "*apollo*" -or ($_.Name -eq "sunshine" -and $_.Path -like "*Apollo*") }) { "RUNNING" } else { "NOT FOUND" }
+        Write-Host "================================================"
+        Write-Host "  STATUS"
+        Write-Host "  Apollo Process   : $proc"
+        Write-Host "  Port 47990 (Web) : $p90"
+        Write-Host "  Port 47989       : $p89"
+        Write-Host "================================================"
+        Write-Host "  RDP"
+        Write-Host "  Username : CloudPC"
+        Write-Host "  Password : Str0ng#Pass99!"
+        Write-Host "  Address  : ${tsIP}:3389"
+        Write-Host "================================================"
+        Write-Host "  APOLLO WEB UI"
+        Write-Host "  URL      : https://${tsIP}:47990"
+        Write-Host "  Username : apollo"
+        Write-Host "  Password : apollo123"
+        Write-Host "================================================"
+        Write-Host "  ARTEMIS HOST IP  : $tsIP"
+        Write-Host "  MACHINE NAME     : $hostname"
+        Write-Host "================================================"
+        Write-Host "  HUONG DAN KET NOI ARTEMIS:"
+        Write-Host "  1. Bat Tailscale phone - dang nhap cung account"
+        Write-Host "  2. Mo Artemis - Add Host - nhap IP: $tsIP"
+        Write-Host "  3. Artemis hien ma PIN 4 so"
+        Write-Host "  4. Mo Chrome - https://${tsIP}:47990"
+        Write-Host "     Bam Advanced - Proceed unsafe"
+        Write-Host "     Hoac go chu: thisisunsafe"
+        Write-Host "  5. Dang nhap apollo/apollo123 - tab PIN - nhap ma"
+        Write-Host "  6. Ket noi! Stream bat dau!"
+        Write-Host "================================================"
+
+    - name: Keep Alive with Apollo Watchdog
+      shell: powershell
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+        # Doc path bang File.ReadAllText tranh loi char array
+        $apolloExe = ""
+        try {
+          $apolloExe = [System.IO.File]::ReadAllText("$env:TEMP\apollo_path.txt").Trim()
+        } catch {}
+        if (-not $apolloExe -or -not (Test-Path $apolloExe)) {
+          $apolloExe = "C:\Program Files\Apollo\sunshine.exe"
+        }
+        Write-Host "Watchdog using: $apolloExe"
+        $procName = (Split-Path $apolloExe -Leaf) -replace "\.exe",""
+        $end = (Get-Date).AddMinutes(325)
+        while ((Get-Date) -lt $end) {
+          $mins = [math]::Round(($end - (Get-Date)).TotalMinutes)
+          $ip = (& $ts ip -4 2>&1 | Select-Object -First 1).Trim()
+          $proc = Get-Process -Name $procName -ErrorAction SilentlyContinue
+          $port = netstat -ano | findstr ":47989"
+          if (-not $proc -or -not $port) {
+            Write-Host "[$([datetime]::Now.ToString('HH:mm:ss'))] Apollo died! Restarting..."
+            if (Test-Path $apolloExe) { Start-Process $apolloExe -WindowStyle Hidden }
+            Start-Sleep -Seconds 10
+          } else {
+            Write-Host "[$([datetime]::Now.ToString('HH:mm:ss'))] OK | $mins min | IP: $ip"
+          }
+          Start-Sleep -Seconds 300
+        }
+        Write-Host "Session ended."
