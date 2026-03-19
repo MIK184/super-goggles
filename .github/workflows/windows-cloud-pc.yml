@@ -1,1 +1,411 @@
+name: 🖥️ Windows Cloud PC (RDP + Sunshine + Tailscale)
 
+on:
+  workflow_dispatch:
+
+jobs:
+  cloud-pc:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+
+    # ═══════════════════════════════════════
+    # 1. TẠO USER & BẬT RDP
+    # ═══════════════════════════════════════
+    - name: 🔑 Setup Windows User & RDP
+      run: |
+        net user WiNSOS "WiNSOS@2024!" /add
+        net localgroup Administrators WiNSOS /add
+        net localgroup "Remote Desktop Users" WiNSOS /add
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+        echo "✅ RDP ready | User: WiNSOS | Pass: WiNSOS@2024!"
+
+    # ═══════════════════════════════════════
+    # 2. TẮT FIREWALL HOÀN TOÀN + MỞ CỔNG
+    # ═══════════════════════════════════════
+    - name: 🔥 Disable ALL Firewall & Open Ports
+      run: |
+        # Tắt tường lửa hoàn toàn - tất cả profile
+        netsh advfirewall set allprofiles state off
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+
+        # Verify tắt thành công
+        $status = netsh advfirewall show allprofiles | Select-String "State"
+        echo "Firewall status: $status"
+
+        # Mở cổng phòng khi firewall vẫn còn
+        $tcpPorts = @(3389,47984,47989,47990,47998,47999,48000,48002,48010,48011,48012)
+        $udpPorts = @(47998,47999,48000,48002,48010,48011,48012,41641)
+        foreach ($p in $tcpPorts) {
+          netsh advfirewall firewall add rule name="Open_TCP_$p" dir=in action=allow protocol=TCP localport=$p | Out-Null
+          netsh advfirewall firewall add rule name="Open_TCP_OUT_$p" dir=out action=allow protocol=TCP localport=$p | Out-Null
+        }
+        foreach ($p in $udpPorts) {
+          netsh advfirewall firewall add rule name="Open_UDP_$p" dir=in action=allow protocol=UDP localport=$p | Out-Null
+        }
+        echo "✅ Firewall OFF | All ports opened"
+
+    # ═══════════════════════════════════════
+    # 3. CÀI VIRTUAL DISPLAY (Sunshine cần display để stream)
+    # ═══════════════════════════════════════
+    - name: 🖥️ Setup Virtual Display Driver
+      run: |
+        # Cài usbmmidd - virtual display driver nhẹ
+        $url = "https://www.amyuni.com/downloads/usbmmiddv0306.zip"
+        try {
+          Invoke-WebRequest -Uri $url -OutFile "vdisplay.zip" -UseBasicParsing -TimeoutSec 30
+          Expand-Archive "vdisplay.zip" -DestinationPath "vdisplay" -Force
+
+          # Tìm installer
+          $inf = Get-ChildItem "vdisplay" -Recurse -Filter "*.inf" | Select-Object -First 1
+          if ($inf) {
+            pnputil /add-driver $inf.FullName /install
+            echo "✅ Virtual display driver installed"
+          }
+        } catch {
+          echo "⚠️ Virtual display zip failed, trying alternative..."
+        }
+
+        # Alternative: dùng Parsec Virtual Display
+        try {
+          $url2 = "https://builds.parsec.app/vdd/parsec-vdd-0.38.0.0.exe"
+          Invoke-WebRequest -Uri $url2 -OutFile "parsec-vdd.exe" -UseBasicParsing -TimeoutSec 30
+          Start-Process "parsec-vdd.exe" -Args "/S" -Wait
+          echo "✅ Parsec Virtual Display installed"
+        } catch {
+          echo "⚠️ Parsec VDD skipped"
+        }
+
+        # Set resolution màn hình (GitHub Actions có sẵn display)
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Display {
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+}
+"@
+        [Display]::SetProcessDPIAware()
+        echo "✅ Display setup done"
+
+    # ═══════════════════════════════════════
+    # 4. CÀI TAILSCALE
+    # ═══════════════════════════════════════
+    - name: 🌐 Install & Start Tailscale
+      run: |
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "ts.exe" -UseBasicParsing
+        Start-Process "ts.exe" -Args "/S" -Wait
+        Start-Sleep -Seconds 12
+        echo "✅ Tailscale installed"
+
+    - name: 🔗 Tailscale Login - Get URL
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+        # Start tailscale up và capture URL
+        $proc = Start-Process -FilePath $ts -ArgumentList "up","--reset" `
+          -RedirectStandardOutput "$env:TEMP\ts_stdout.txt" `
+          -RedirectStandardError "$env:TEMP\ts_stderr.txt" `
+          -NoNewWindow -PassThru
+
+        Start-Sleep -Seconds 25
+
+        $out = (Get-Content "$env:TEMP\ts_stdout.txt" -ErrorAction SilentlyContinue) -join "`n"
+        $err = (Get-Content "$env:TEMP\ts_stderr.txt" -ErrorAction SilentlyContinue) -join "`n"
+        $combined = "$out`n$err"
+
+        # Extract URL
+        $urlMatch = [regex]::Match($combined, 'https://login\.tailscale\.com\S+')
+        $loginUrl = if ($urlMatch.Success) { $urlMatch.Value } else { "Chạy lại: $ts up để lấy URL" }
+
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════╗"
+        echo "║   📱 MỞ LINK NÀY TRÊN ĐIỆN THOẠI ĐỂ ĐĂNG NHẬP:         ║"
+        echo "╠══════════════════════════════════════════════════════════╣"
+        echo "   $loginUrl"
+        echo "╚══════════════════════════════════════════════════════════╝"
+
+        # Đợi đăng nhập - 10 phút
+        echo "⏳ Đang chờ bạn đăng nhập Tailscale..."
+        for ($i = 0; $i -lt 60; $i++) {
+          $status = (& $ts status 2>&1) -join " "
+          if ($status -match '^\d{1,3}\.\d' -or ($status.Length -gt 20 -and $status -notlike "*NeedsLogin*" -and $status -notlike "*Logged out*")) {
+            echo "✅ Tailscale CONNECTED!"
+            & $ts status
+            break
+          }
+          # Nhắc URL mỗi 2 phút
+          if ($i % 12 -eq 0 -and $i -gt 0) {
+            $upOut = (& $ts up 2>&1) -join "`n"
+            $m = [regex]::Match($upOut, 'https://login\.tailscale\.com\S+')
+            if ($m.Success) { echo "🔗 URL: $($m.Value)" }
+          }
+          Start-Sleep -Seconds 10
+        }
+
+    # ═══════════════════════════════════════
+    # 5. CÀI SUNSHINE (bản mới nhất)
+    # ═══════════════════════════════════════
+    - name: ☀️ Download & Install Sunshine
+      run: |
+        # Lấy bản mới nhất từ GitHub API
+        $headers = @{ "User-Agent" = "Mozilla/5.0" }
+        try {
+          $release = Invoke-RestMethod "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" -Headers $headers
+          $asset = $release.assets | Where-Object {
+            $_.name -like "*windows*installer*.exe" -or $_.name -like "*sunshine-windows*.exe"
+          } | Select-Object -First 1
+          $dlUrl = $asset.browser_download_url
+          $version = $release.tag_name
+          echo "📦 Installing Sunshine $version"
+        } catch {
+          $dlUrl = "https://github.com/LizardByte/Sunshine/releases/download/v0.23.1/sunshine-windows-installer.exe"
+          echo "📦 Installing Sunshine v0.23.1 (fallback)"
+        }
+
+        Invoke-WebRequest -Uri $dlUrl -OutFile "sunshine-installer.exe" -UseBasicParsing
+        Start-Process "sunshine-installer.exe" -Args "/S" -Wait
+        Start-Sleep -Seconds 20
+
+        # Xác nhận cài xong
+        $ssExe = @(
+          "C:\Program Files\Sunshine\sunshine.exe",
+          "C:\Program Files (x86)\Sunshine\sunshine.exe",
+          "C:\Program Files\Sunshine\bin\sunshine.exe"
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+        if ($ssExe) {
+          echo "✅ Sunshine installed: $ssExe"
+          echo $ssExe | Set-Content "$env:TEMP\sunshine_path.txt"
+        } else {
+          echo "❌ Sunshine exe not found! Listing Program Files..."
+          Get-ChildItem "C:\Program Files" -Recurse -Filter "sunshine.exe" -ErrorAction SilentlyContinue
+        }
+
+    # ═══════════════════════════════════════
+    # 6. CẤU HÌNH SUNSHINE (quan trọng nhất)
+    # ═══════════════════════════════════════
+    - name: ⚙️ Configure Sunshine Properly
+      run: |
+        $ssExe = Get-Content "$env:TEMP\sunshine_path.txt" -ErrorAction SilentlyContinue
+        if (-not $ssExe) {
+          $ssExe = @(
+            "C:\Program Files\Sunshine\sunshine.exe",
+            "C:\Program Files (x86)\Sunshine\sunshine.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
+
+        # Tìm config dir
+        $ssDir = Split-Path $ssExe -Parent
+        $configDir = "$ssDir\config"
+        if (-not (Test-Path $configDir)) {
+          $configDir = "$env:ProgramData\Sunshine"
+        }
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+        echo "📁 Config dir: $configDir"
+
+        # ---- sunshine.conf ----
+        $conf = @"
+origin_web_ui_allowed = wan
+upnp = enabled
+port = 47989
+address_family = both
+min_log_level = debug
+"@
+        Set-Content "$configDir\sunshine.conf" $conf -Encoding UTF8
+
+        # ---- Tạo credentials bằng CLI ----
+        echo "🔐 Setting Sunshine credentials..."
+        # Method 1: --creds flag
+        Start-Process $ssExe -ArgumentList "--creds","sunshine","sunshine123" -Wait -NoNewWindow
+        Start-Sleep -Seconds 3
+
+        # Method 2: trực tiếp ghi file nếu CLI không work
+        $credFile = "$configDir\credentials.json"
+        if (-not (Test-Path $credFile) -or (Get-Item $credFile).Length -lt 10) {
+          # Sunshine dùng bcrypt, nhưng cũng support plain sha256 trong một số version
+          # Dùng sunshine CLI để hash
+          $hashOutput = & $ssExe --creds sunshine sunshine123 2>&1
+          echo "Creds output: $hashOutput"
+        }
+
+        # Kiểm tra credential file
+        if (Test-Path $credFile) {
+          echo "✅ Credentials file exists:"
+          Get-Content $credFile
+        } else {
+          echo "⚠️ Credentials file not found at $credFile"
+          # List all files in config
+          Get-ChildItem $configDir
+        }
+
+        echo $configDir | Set-Content "$env:TEMP\sunshine_config.txt"
+        echo "✅ Sunshine configured | Login: sunshine / sunshine123"
+
+    # ═══════════════════════════════════════
+    # 7. KHỞI ĐỘNG SUNSHINE - ĐẢM BẢO 100% BẬT
+    # ═══════════════════════════════════════
+    - name: 🚀 Start Sunshine & VERIFY Running
+      run: |
+        $ssExe = Get-Content "$env:TEMP\sunshine_path.txt" -ErrorAction SilentlyContinue
+        if (-not $ssExe) {
+          $ssExe = @(
+            "C:\Program Files\Sunshine\sunshine.exe",
+            "C:\Program Files (x86)\Sunshine\sunshine.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
+
+        $configDir = Get-Content "$env:TEMP\sunshine_config.txt" -ErrorAction SilentlyContinue
+        if (-not $configDir) { $configDir = "C:\Program Files\Sunshine\config" }
+
+        # ---- Khởi động Sunshine ----
+        echo "🚀 Starting Sunshine..."
+
+        # Thử start qua service trước
+        $svc = Get-Service | Where-Object { $_.Name -like "*sunshine*" -or $_.DisplayName -like "*sunshine*" }
+        if ($svc) {
+          echo "Found service: $($svc.Name)"
+          Set-Service -Name $svc.Name -StartupType Automatic
+          Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
+        }
+
+        # Start trực tiếp exe (chạy trong background với config)
+        $cfgFile = "$configDir\sunshine.conf"
+        $proc = Start-Process -FilePath $ssExe `
+          -ArgumentList $cfgFile `
+          -WindowStyle Hidden `
+          -PassThru
+        echo "Started PID: $($proc.Id)"
+        Start-Sleep -Seconds 10
+
+        # ---- VERIFY - kiểm tra port 47990 có lắng nghe không ----
+        $maxTries = 12
+        $success = $false
+        for ($try = 1; $try -le $maxTries; $try++) {
+          $listening = netstat -ano | findstr ":47990"
+          $process = Get-Process | Where-Object { $_.Name -like "*sunshine*" }
+
+          echo "--- Check $try/$maxTries ---"
+          if ($process) { echo "Process: $($process.Name) PID=$($process.Id)" }
+
+          if ($listening) {
+            echo "✅ PORT 47990 IS OPEN! Sunshine is RUNNING!"
+            echo $listening
+            $success = $true
+            break
+          } else {
+            echo "⏳ Port 47990 not open yet... retry in 10s"
+            # Nếu process chết thì restart
+            if (-not $process) {
+              echo "⚠️ Sunshine not running, restarting..."
+              Start-Process -FilePath $ssExe -ArgumentList $cfgFile -WindowStyle Hidden -PassThru
+            }
+            Start-Sleep -Seconds 10
+          }
+        }
+
+        if (-not $success) {
+          echo "❌ WARNING: Port 47990 not detected after 2 min"
+          echo "Checking all Sunshine-related ports..."
+          netstat -ano | findstr "4798\|4799\|4800\|4801"
+          echo "Sunshine processes:"
+          Get-Process | Where-Object { $_.Name -like "*sun*" }
+          echo "Trying to start again..."
+          Start-Process -FilePath $ssExe -WindowStyle Hidden
+          Start-Sleep -Seconds 15
+          netstat -ano | findstr ":4798\|:4799\|:4800"
+        }
+
+        # Kiểm tra thêm port 47989
+        $port47989 = netstat -ano | findstr ":47989"
+        if ($port47989) { echo "✅ Port 47989 also OPEN" }
+
+    # ═══════════════════════════════════════
+    # 8. IN ĐẦY ĐỦ THÔNG TIN + HƯỚNG DẪN
+    # ═══════════════════════════════════════
+    - name: 📋 Print Connection Info
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+        $tsIP = (& $ts ip -4 2>&1 | Select-Object -First 1).Trim()
+        $hostname = hostname
+
+        # Kiểm tra lần cuối
+        $port47990 = if (netstat -ano | findstr ":47990") { "✅ OPEN" } else { "❌ CLOSED" }
+        $port47989 = if (netstat -ano | findstr ":47989") { "✅ OPEN" } else { "❌ CLOSED" }
+        $ssProcRunning = if (Get-Process | Where-Object { $_.Name -like "*sunshine*" }) { "✅ RUNNING" } else { "❌ NOT FOUND" }
+
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║             ✅ THÔNG TIN KẾT NỐI - READY!                   ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  STATUS CHECK:                                               ║"
+        echo "║  Sunshine Process : $ssProcRunning                           ║"
+        echo "║  Port 47990 (Web) : $port47990                               ║"
+        echo "║  Port 47989 (NV)  : $port47989                               ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  💻 RDP:                                                     ║"
+        echo "║     Username : WiNSOS                                        ║"
+        echo "║     Password : WiNSOS@2024!                                  ║"
+        echo "║     Address  : ${tsIP}:3389                                  ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  ☀️  SUNSHINE WEB UI:                                        ║"
+        echo "║     URL      : https://${tsIP}:47990                         ║"
+        echo "║     Username : sunshine                                      ║"
+        echo "║     Password : sunshine123                                   ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  📱 MOONLIGHT - CÁC BƯỚC KẾT NỐI:                          ║"
+        echo "║  1. Bật Tailscale phone -> đăng nhập cùng account            ║"
+        echo "║  2. Moonlight -> Add Host -> nhập IP: $tsIP                  ║"
+        echo "║  3. Moonlight sẽ thấy máy -> bấm vào -> hiện mã PIN         ║"
+        echo "║  4. Mở Chrome -> https://${tsIP}:47990                       ║"
+        echo "║     -> Advanced -> Proceed (unsafe) hoặc gõ: thisisunsafe    ║"
+        echo "║  5. Đăng nhập sunshine/sunshine123 -> tab PIN -> nhập mã     ║"
+        echo "║  6. Kết nối! 🎮                                              ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  🌐 Tailscale IP : $tsIP                                     ║"
+        echo "║  🖥️  Machine     : $hostname                                 ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+
+    # ═══════════════════════════════════════
+    # 9. GIỮ MÁY SỐNG + WATCHDOG (tự restart Sunshine nếu chết)
+    # ═══════════════════════════════════════
+    - name: ⏳ Keep Alive + Sunshine Watchdog
+      run: |
+        $ts = "C:\Program Files\Tailscale\tailscale.exe"
+        $ssExe = Get-Content "$env:TEMP\sunshine_path.txt" -ErrorAction SilentlyContinue
+        if (-not $ssExe) {
+          $ssExe = @(
+            "C:\Program Files\Sunshine\sunshine.exe",
+            "C:\Program Files (x86)\Sunshine\sunshine.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        }
+
+        $end = (Get-Date).AddMinutes(325)
+        $tick = 0
+
+        while ((Get-Date) -lt $end) {
+          $mins = [math]::Round(($end - (Get-Date)).TotalMinutes)
+          $ip = (& $ts ip -4 2>&1 | Select-Object -First 1).Trim()
+
+          # Mỗi 5 phút check
+          if ($tick % 1 -eq 0) {
+            $ssProc = Get-Process | Where-Object { $_.Name -like "*sunshine*" }
+            $portOpen = netstat -ano | findstr ":47989"
+
+            if (-not $ssProc -or -not $portOpen) {
+              echo "⚠️ [$([datetime]::Now.ToString('HH:mm:ss'))] Sunshine died! Restarting..."
+              Start-Process -FilePath $ssExe -WindowStyle Hidden
+              Start-Sleep -Seconds 10
+              echo "🔄 Sunshine restarted"
+            } else {
+              echo "✅ [$([datetime]::Now.ToString('HH:mm:ss'))] Còn $mins phút | IP: $ip | Sunshine: OK"
+            }
+          }
+
+          $tick++
+          Start-Sleep -Seconds 300
+        }
+        echo "⏹️ Session ended."
