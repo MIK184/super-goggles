@@ -13,13 +13,29 @@ jobs:
     - name: Setup Windows User and RDP
       shell: powershell
       run: |
-        net user WiNSOS "WiNSOS@2024!" /add
-        net localgroup Administrators WiNSOS /add
-        net localgroup "Remote Desktop Users" WiNSOS /add
+        # Dung password khong chua ten user - tranh loi policy
+        $user = "CloudPC"
+        $pass = "Str0ng#Pass99!"
+
+        # Tao user bang PowerShell (chac chan hon net user)
+        $secPass = ConvertTo-SecureString $pass -AsPlainText -Force
+        New-LocalUser -Name $user -Password $secPass -FullName "Cloud PC User" -Description "Remote user" -PasswordNeverExpires -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+
+        # Bat RDP
         Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
         Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
-        Write-Host "RDP ready - User: WiNSOS / Pass: WiNSOS@2024!"
+
+        # Xac nhan user da duoc tao
+        $check = Get-LocalUser -Name $user -ErrorAction SilentlyContinue
+        if ($check) {
+          Write-Host "RDP ready - User: $user / Pass: $pass"
+        } else {
+          Write-Host "ERROR: User creation failed"
+          exit 1
+        }
 
     - name: Disable Firewall and Open All Ports
       shell: powershell
@@ -201,8 +217,8 @@ jobs:
         Write-Host "  Port 47989       : $p89"
         Write-Host "================================================"
         Write-Host "  RDP INFO"
-        Write-Host "  Username : WiNSOS"
-        Write-Host "  Password : WiNSOS@2024!"
+        Write-Host "  Username : CloudPC"
+        Write-Host "  Password : Str0ng#Pass99!"
         Write-Host "  Address  : ${tsIP}:3389"
         Write-Host "================================================"
         Write-Host "  SUNSHINE WEB UI"
